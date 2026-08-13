@@ -11,6 +11,7 @@ from smugmug import RateLimitError, SmugMugClient, SmugMugError
 from smugmug.client import (
     _filter_duplicates,
     _log_rate_limit_headers,
+    _md5_streaming,
     _parse_retry_after,
     _rate_limit_error,
     _wait_after_rate_limit,
@@ -35,12 +36,14 @@ class FakeSession(OAuth1Session):
         self.responses = list(responses)
         self.calls = 0
         self.last_kwargs: dict | None = None
+        self.get_params: list = []
 
     def _next(self):
         self.calls += 1
         return self.responses[min(self.calls, len(self.responses)) - 1]
 
     def get(self, *args, **kwargs):
+        self.get_params.append(kwargs.get("params"))
         return self._next()
 
     def post(self, *args, **kwargs):
@@ -405,7 +408,8 @@ def test_upload_parallel_uploads_all_files(monkeypatch, tmp_path):
         "/api/v2/album/x", tmp_path, dedup=False, max_workers=2
     )
 
-    assert [r["file_name"] for r in uploaded] == ["a.jpg", "b.jpg"]
+    # as_completed yields in completion order — compare as a set.
+    assert sorted(r["file_name"] for r in uploaded) == ["a.jpg", "b.jpg"]
     assert skipped == 0
 
 
@@ -520,3 +524,125 @@ def test_context_manager_closes_session(monkeypatch):
         pass
 
     assert closed == [True]
+
+
+def test_pagination_passes_params_only_on_first_request():
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={
+                    "Response": {
+                        "Node": [{"Name": "a"}],
+                        "Pages": {"NextPage": "/x!children?start=2&count=2"},
+                    }
+                },
+            ),
+            FakeResp(200, {}, json_data={"Response": {"Node": [{"Name": "b"}]}}),
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    children = client.get_node_children("/api/v2/node/x", count=2)
+
+    assert [c["Name"] for c in children] == ["a", "b"]
+    assert session.get_params == [{"count": 2}, None]
+
+
+def test_get_node_children_handles_null_node():
+    session = FakeSession([FakeResp(200, {}, json_data={"Response": {"Node": None}})])
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client.get_node_children("/api/v2/node/x") == []
+
+
+def test_get_album_images_handles_null_album_image():
+    session = FakeSession(
+        [FakeResp(200, {}, json_data={"Response": {"AlbumImage": None}})]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client.get_album_images("/api/v2/album/x") == []
+
+
+def test_image_count_handles_null_album():
+    session = FakeSession([FakeResp(200, {}, json_data={"Response": {"Album": None}})])
+    client = SmugMugClient(session, root_node_uri="")
+
+    with pytest.raises(SmugMugError):
+        client.image_count("/api/v2/album/x")
+
+
+def test_md5_streaming(tmp_path):
+    data = b"x" * 200_000  # crosses the 64 KiB chunk boundary
+    path = tmp_path / "big.bin"
+    path.write_bytes(data)
+
+    assert _md5_streaming(path) == hashlib.md5(data).hexdigest()
+
+
+def test_upload_file_streams_with_correct_headers(tmp_path):
+    content = b"stream me"
+    path = tmp_path / "a.jpg"
+    path.write_bytes(content)
+
+    session = FakeSession([FakeResp(200, {}, json_data=UPLOAD_OK)])
+    client = SmugMugClient(session, root_node_uri="")
+
+    result = client.upload_file("/api/v2/album/x", path)
+
+    assert session.last_kwargs is not None
+    headers = session.last_kwargs["headers"]
+    assert headers["Content-Length"] == str(len(content))
+    assert headers["Content-MD5"] == hashlib.md5(content).hexdigest()
+    assert result is not None
+    assert result["md5"] == headers["Content-MD5"]
+
+
+def test_upload_file_retries_with_fresh_file_handle(monkeypatch, tmp_path):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+    path = tmp_path / "a.jpg"
+    path.write_bytes(b"abc")
+
+    class FlakyPostSession(FakeSession):
+        def __init__(self):
+            super().__init__([FakeResp(200, {}, json_data=UPLOAD_OK)])
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise requests.exceptions.ConnectionError("boom")
+            return self.responses[0]
+
+    session = FlakyPostSession()
+    client = SmugMugClient(session, root_node_uri="")
+
+    result = client.upload_file("/api/v2/album/x", path)
+
+    assert result is not None
+    assert session.calls == 2
+
+
+def test_upload_bytes_surfaces_stat_fail_message(caplog):
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={
+                    "stat": "fail",
+                    "code": 5,
+                    "message": "Invalid image file",
+                },
+            )
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    with caplog.at_level(logging.ERROR, logger="smugmug"):
+        result = client._upload_bytes("/api/v2/album/x", "bad.jpg", b"abc")
+
+    assert result is None
+    assert session.calls == 1
+    assert any("Invalid image file" in r.message for r in caplog.records)

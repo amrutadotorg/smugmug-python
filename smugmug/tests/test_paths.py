@@ -91,6 +91,18 @@ def test_split_album_path_ignores_leading_trailing_slashes(
     assert album == expected_album
 
 
+@pytest.mark.parametrize("full_path", ["", "   ", "/", "//"])
+def test_split_album_path_rejects_empty(full_path):
+    with pytest.raises(SmugMugError):
+        _split_album_path(full_path)
+
+
+def test_split_album_path_filters_empty_segments():
+    parent, album = _split_album_path("Parent//Album")
+    assert parent == "Parent"
+    assert album == "Album"
+
+
 def test_list_upload_files_sorts_and_skips_hidden(tmp_path):
     (tmp_path / "b.jpg").write_bytes(b"")
     (tmp_path / "a.png").write_bytes(b"")

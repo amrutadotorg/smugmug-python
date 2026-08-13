@@ -9,6 +9,7 @@ import functools
 import hashlib
 import logging
 import mimetypes
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,8 +64,12 @@ def _split_album_path(full_path: str) -> tuple[str, str]:
     Leading/trailing slashes are ignored so "Parent/Album/", "/Parent/Album" and
     "/Album/" work like their slash-less counterparts.
     """
-    full_path = str(full_path).strip("/")
-    parts = [_sanitize_path_segment(p).strip() for p in full_path.split("/")]
+    full_path = str(full_path).strip().strip("/")
+    if not full_path:
+        raise SmugMugError("Album path cannot be empty")
+    parts = [
+        _sanitize_path_segment(p).strip() for p in full_path.split("/") if p.strip()
+    ]
     if len(parts) > 2:
         raise SmugMugError(
             f"Expected 'parent/album' path, got {len(parts)} segments: {full_path!r}"
@@ -103,7 +108,7 @@ def _filter_duplicates(
     kept: list[Path] = []
     skipped = 0
     for fp in files:
-        local_md5 = hashlib.md5(fp.read_bytes()).hexdigest()
+        local_md5 = _md5_streaming(fp)
         if local_md5 in existing_md5s:
             logger.debug(f"Dup skip: {fp.name} (MD5: {local_md5[:8]}...)")
             skipped += 1
@@ -114,6 +119,58 @@ def _filter_duplicates(
             )
         kept.append(fp)
     return kept, skipped
+
+
+def _md5_streaming(file_path: Path, chunk_size: int = 64 * 1024) -> str:
+    """Hex MD5 of a file without loading it into memory."""
+    md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(chunk_size):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def _validate_file_name(file_name: str) -> None:
+    # Control characters would be rejected by requests (InvalidHeader);
+    # fail with a clear SmugMugError before the request instead.
+    if re.search(r"[\x00-\x1f\x7f]", file_name):
+        raise SmugMugError(f"File name contains control characters: {file_name!r}")
+
+
+def _upload_result(
+    result: dict[str, Any], md5_hash: str, file_name: str
+) -> dict[str, str]:
+    img = result.get("Image", {})
+    image_url = img.get("URL", "")
+    image_uri = img.get("ImageUri", "")
+    upload_key = img.get("UploadKey", "")
+    logger.info(f"Upload OK: {file_name} → {image_url}")
+    return {
+        "url": image_url,
+        "image_uri": image_uri,
+        "image_key": upload_key,
+        "md5": md5_hash,
+        "file_name": file_name,
+    }
+
+
+def _upload_request_status(r, file_name: str) -> dict[str, Any]:
+    """Validate an upload response; return the result dict or raise SmugMugError."""
+    if r.status_code == 429:
+        raise _rate_limit_error(r, f"Upload {file_name}")
+    if r.status_code == 200:
+        result = r.json()
+        if result.get("stat") == "ok":
+            return result
+        message = result.get("message", r.text[:200])
+        raise SmugMugError(f"Upload rejected by SmugMug: {message}", status_code=200)
+    if 500 <= r.status_code < 600:
+        raise SmugMugError(
+            f"HTTP {r.status_code} — {r.text[:200]}", status_code=r.status_code
+        )
+    raise SmugMugError(
+        f"HTTP {r.status_code}: {r.text[:200]}", status_code=r.status_code
+    )
 
 
 class SmugMugError(Exception):
@@ -407,10 +464,12 @@ class SmugMugClient:
         """List all children of a node (paginated). Propagates errors — callers must handle SmugMugError."""
         children: list[dict[str, Any]] = []
         next_page_uri: str | None = f"{node_uri}!children"
+        params: dict[str, Any] | None = {"count": count}
         while next_page_uri:
-            data = self._get(next_page_uri, {"count": count})
-            children.extend(data.get("Node", []))
+            data = self._get(next_page_uri, params)
+            children.extend(data.get("Node") or [])
             next_page_uri = data.get("Pages", {}).get("NextPage")
+            params = None  # NextPage already carries the compiled query string
         return children
 
     def get_node(
@@ -502,7 +561,7 @@ class SmugMugClient:
 
     def image_count(self, album_uri: str) -> int:
         data = self._get(album_uri, params={"_filter": "ImageCount"})
-        count = data.get("Album", {}).get("ImageCount")
+        count = (data.get("Album") or {}).get("ImageCount")
         if count is None:
             raise SmugMugError(f"Album {album_uri} has no ImageCount")
         return count
@@ -510,10 +569,12 @@ class SmugMugClient:
     def get_album_images(self, album_uri: str) -> list[str]:
         uris: list[str] = []
         next_page_uri: str | None = f"{album_uri}!images"
+        params: dict[str, Any] | None = {"count": 500}
         while next_page_uri:
-            data = self._get(next_page_uri, {"count": 500})
-            uris.extend(x["Uri"] for x in data.get("AlbumImage", []))
+            data = self._get(next_page_uri, params)
+            uris.extend(x["Uri"] for x in data.get("AlbumImage") or [])
             next_page_uri = data.get("Pages", {}).get("NextPage")
+            params = None  # NextPage already carries the compiled query string
         return uris
 
     # --- Album organization ---
@@ -618,9 +679,10 @@ class SmugMugClient:
     def get_album_image_hashes(self, album_uri: str) -> list[dict[str, str]]:
         images: list[dict[str, str]] = []
         next_page_uri: str | None = f"{album_uri}!images"
+        params: dict[str, Any] | None = {"count": 500, "_expand": "Image"}
         while next_page_uri:
-            data = self._get(next_page_uri, {"count": 500, "_expand": "Image"})
-            for img in data.get("AlbumImage", []):
+            data = self._get(next_page_uri, params)
+            for img in data.get("AlbumImage") or []:
                 images.append(
                     {
                         "FileName": img.get("FileName", ""),
@@ -630,6 +692,7 @@ class SmugMugClient:
                     }
                 )
             next_page_uri = data.get("Pages", {}).get("NextPage")
+            params = None  # NextPage already carries the compiled query string
         return images
 
     def upload(
@@ -648,9 +711,8 @@ class SmugMugClient:
         sequentially with a small pause; higher values upload in parallel.
         Returns (uploaded, skipped).
 
-        The whole file is loaded into memory for hashing and upload — fine
-        for typical JPEGs, but budget RAM when uploading large video/RAW
-        files, especially in parallel.
+        Files are hashed and uploaded in streaming fashion (bounded memory).
+        Only the in-memory ``_upload_bytes`` variant loads whole files.
         """
         files = _list_upload_files(folder_path, extensions)
         if not files:
@@ -694,18 +756,55 @@ class SmugMugClient:
     # --- Upload ---
 
     def upload_file(self, album_uri: str, file_path: Path) -> dict[str, str] | None:
-        """Upload a single file. Loads it fully into memory (see upload_new_only)."""
-        with open(file_path, "rb") as f:
-            image_data = f.read()
-        return self._upload_bytes(album_uri, file_path.name, image_data)
+        """Upload a single file, streamed from disk (bounded memory usage)."""
+        file_name = file_path.name
+        _validate_file_name(file_name)
+        mime_type, _ = mimetypes.guess_type(file_name)
+        content_type = mime_type or _RAW_MIME_TYPES.get(file_path.suffix.lower())
+        if not content_type:
+            logger.warning(
+                f"Unknown file type for {file_name!r}, sending as image/jpeg"
+            )
+            content_type = "image/jpeg"
+
+        # Content-MD5 is sent as hex: SmugMug compares it as an opaque dedup
+        # key and reports the same 32-char hex digest as ArchivedMD5 (RFC 1864
+        # base64 is NOT what the live API accepts — see community clients).
+        md5_hash = _md5_streaming(file_path)
+        size = os.path.getsize(file_path)
+        headers = {
+            "Accept": "application/json",
+            "Content-Length": str(size),
+            "Content-MD5": md5_hash,
+            "Content-Type": content_type,
+            "X-Smug-AlbumUri": album_uri,
+            "X-Smug-FileName": file_name,
+            "X-Smug-ResponseType": "JSON",
+            "X-Smug-Version": "v2",
+        }
+
+        @_make_upload_retry(file_name)
+        def _do_upload():
+            # Re-open per attempt: a consumed file object cannot be replayed.
+            with open(file_path, "rb") as f:
+                r = self.session.post(
+                    UPLOAD_URL, headers=headers, data=f, timeout=UPLOAD_TIMEOUT
+                )
+            return _upload_request_status(r, file_name)
+
+        try:
+            result = _do_upload()
+        except (SmugMugError, requests.exceptions.RequestException) as e:
+            logger.error(f"Upload FAILED for {file_name}: {e}")
+            return None
+        return _upload_result(result, md5_hash, file_name)
 
     def _upload_bytes(
         self, album_uri: str, file_name: str, image_data: bytes
     ) -> dict[str, str] | None:
         # Control characters would be rejected by requests (InvalidHeader);
         # fail with a clear SmugMugError before the request instead.
-        if re.search(r"[\x00-\x1f\x7f]", file_name):
-            raise SmugMugError(f"File name contains control characters: {file_name!r}")
+        _validate_file_name(file_name)
         mime_type, _ = mimetypes.guess_type(file_name)
         content_type = mime_type or _RAW_MIME_TYPES.get(Path(file_name).suffix.lower())
         if not content_type:
@@ -734,39 +833,14 @@ class SmugMugClient:
             r = self.session.post(
                 UPLOAD_URL, headers=headers, data=image_data, timeout=UPLOAD_TIMEOUT
             )
-            if r.status_code == 429:
-                raise _rate_limit_error(r, f"Upload {file_name}")
-            if r.status_code == 200:
-                result = r.json()
-                if result.get("stat") == "ok":
-                    return result
-            if 500 <= r.status_code < 600:
-                raise SmugMugError(
-                    f"HTTP {r.status_code} — {r.text[:200]}",
-                    status_code=r.status_code,
-                )
-            raise SmugMugError(
-                f"HTTP {r.status_code}: {r.text[:200]}", status_code=r.status_code
-            )
+            return _upload_request_status(r, file_name)
 
         try:
             result = _do_upload()
         except (SmugMugError, requests.exceptions.RequestException) as e:
             logger.error(f"Upload FAILED for {file_name}: {e}")
             return None
-
-        img = result.get("Image", {})
-        image_url = img.get("URL", "")
-        image_uri = img.get("ImageUri", "")
-        upload_key = img.get("UploadKey", "")
-        logger.info(f"Upload OK: {file_name} → {image_url}")
-        return {
-            "url": image_url,
-            "image_uri": image_uri,
-            "image_key": upload_key,
-            "md5": md5_hash,
-            "file_name": file_name,
-        }
+        return _upload_result(result, md5_hash, file_name)
 
     def upload_new_only(
         self, album_uri: str, folder_path: Path, extensions: set[str] | None = None
