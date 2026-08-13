@@ -21,7 +21,6 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_exponential,
 )
 
 logger = logging.getLogger("smugmug")
@@ -54,12 +53,67 @@ class SmugMugError(Exception):
     pass
 
 
+class RateLimitError(SmugMugError):
+    """Raised when SmugMug returns HTTP 429. Carries the Retry-After hint."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+RATE_LIMIT_WARNING_THRESHOLD = 10
+RATE_LIMIT_MAX_SLEEP = 60.0
+
+
+def _parse_retry_after(r) -> float | None:
+    """Parse the Retry-After header (seconds per SmugMug docs)."""
+    raw = r.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except TypeError, ValueError:
+        return None
+
+
+def _rate_limit_error(r, context: str) -> RateLimitError:
+    return RateLimitError(
+        f"{context}: HTTP 429 — {r.text[:200]}", retry_after=_parse_retry_after(r)
+    )
+
+
+def _log_rate_limit_headers(r) -> None:
+    """Warn when the current window is nearly exhausted (X-RateLimit-Remaining)."""
+    remaining = r.headers.get("X-RateLimit-Remaining")
+    if (
+        remaining
+        and remaining.isdigit()
+        and int(remaining) <= RATE_LIMIT_WARNING_THRESHOLD
+    ):
+        logger.warning(
+            f"SmugMug rate limit low: {remaining} requests remaining in window"
+        )
+
+
+def _wait_after_rate_limit(retry_state) -> float:
+    """Sleep Retry-After on 429 (capped), exponential backoff otherwise."""
+    exc = retry_state.outcome.exception()
+    if isinstance(exc, RateLimitError) and exc.retry_after:
+        return min(max(exc.retry_after, 1.0), RATE_LIMIT_MAX_SLEEP)
+    return min(2**retry_state.attempt_number, 10.0)
+
+
 _SESSION_RETRY = retry(
     retry=retry_if_exception_type(
-        (SmugMugError, requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        (
+            RateLimitError,
+            SmugMugError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        )
     ),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    stop=stop_after_attempt(3),
+    wait=_wait_after_rate_limit,
+    stop=stop_after_attempt(5),
     reraise=True,
 )
 
@@ -133,10 +187,14 @@ class SmugMugClient:
             params=params,
             timeout=REQUEST_TIMEOUT,
         )
+        if r.status_code == 429:
+            raise _rate_limit_error(r, f"GET {uri}")
         if r.status_code not in (200, 201):
             raise SmugMugError(f"GET {uri}: HTTP {r.status_code} — {r.text[:300]}")
+        _log_rate_limit_headers(r)
         return r.json()
 
+    @_SESSION_RETRY
     def _post(
         self,
         uri: str,
@@ -149,10 +207,14 @@ class SmugMugClient:
         elif data:
             kwargs["data"] = data
         r = self.session.post(f"{API_BASE}{uri}", **kwargs)  # type: ignore[arg-type]
+        if r.status_code == 429:
+            raise _rate_limit_error(r, f"POST {uri}")
         if r.status_code not in (200, 201):
             raise SmugMugError(f"POST {uri}: HTTP {r.status_code} — {r.text[:300]}")
+        _log_rate_limit_headers(r)
         return r.json()
 
+    @_SESSION_RETRY
     def _patch(self, uri: str, payload: dict[str, Any]) -> bool:
         r = self.session.patch(
             f"{API_BASE}{uri}",
@@ -160,13 +222,20 @@ class SmugMugClient:
             json=payload,
             timeout=REQUEST_TIMEOUT,
         )
+        if r.status_code == 429:
+            raise _rate_limit_error(r, f"PATCH {uri}")
         if r.status_code == 200:
+            _log_rate_limit_headers(r)
             return True
         logger.warning(f"PATCH {uri}: HTTP {r.status_code} — {r.text[:200]}")
         return False
 
+    @_SESSION_RETRY
     def _delete(self, uri: str) -> bool:
         r = self.session.delete(f"{API_BASE}{uri}", timeout=REQUEST_TIMEOUT)
+        if r.status_code == 429:
+            raise _rate_limit_error(r, f"DELETE {uri}")
+        _log_rate_limit_headers(r)
         return r.status_code in (200, 201)
 
     # --- Node operations ---
@@ -269,7 +338,9 @@ class SmugMugClient:
         next_page_uri: str | None = f"{album_uri}!images"
         while next_page_uri:
             data = self._get(next_page_uri, {"count": 500})
-            uris.extend(x["Uri"] for x in data.get("Response", {}).get("AlbumImage", []))
+            uris.extend(
+                x["Uri"] for x in data.get("Response", {}).get("AlbumImage", [])
+            )
             next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
         return uris
 
@@ -452,17 +523,18 @@ class SmugMugClient:
         @retry(
             retry=retry_if_exception_type(
                 (
+                    RateLimitError,
                     SmugMugError,
                     requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                 )
             ),
-            wait=wait_exponential(multiplier=1, min=2, max=10),
-            stop=stop_after_attempt(3),
+            wait=_wait_after_rate_limit,
+            stop=stop_after_attempt(4),
             reraise=True,
             after=lambda retry_state: (
                 logger.warning(
-                    f"Upload {file_name}: {retry_state.outcome.exception()}, retry {retry_state.attempt_number}/2"
+                    f"Upload {file_name}: {retry_state.outcome.exception()}, retry {retry_state.attempt_number}/3"
                 )
                 if retry_state.outcome and retry_state.outcome.failed
                 else None
@@ -472,6 +544,8 @@ class SmugMugClient:
             r = self.session.post(
                 UPLOAD_URL, headers=headers, data=image_data, timeout=UPLOAD_TIMEOUT
             )
+            if r.status_code == 429:
+                raise _rate_limit_error(r, f"Upload {file_name}")
             if r.status_code == 200:
                 result = r.json()
                 if result.get("stat") == "ok":

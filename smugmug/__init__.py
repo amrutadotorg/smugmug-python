@@ -1,7 +1,7 @@
 """SmugMug API v2 client library."""
 
-from smugmug.client import SmugMugClient, SmugMugError
+from smugmug.client import RateLimitError, SmugMugClient, SmugMugError
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
-__all__ = ["SmugMugClient", "SmugMugError", "__version__"]
+__all__ = ["RateLimitError", "SmugMugClient", "SmugMugError", "__version__"]

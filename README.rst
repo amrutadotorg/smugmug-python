@@ -64,3 +64,19 @@ Integration tests (live API, requires ``SMUGMUG_API_KEY``, ``SMUGMUG_API_SECRET`
 ``SMUGMUG_ACCESS_TOKEN``, ``SMUGMUG_TOKEN_SECRET`` env vars): ::
 
     SMUGMUG_API_KEY=... uv run pytest smugmug/tests -m integration -q
+
+Rate limits
+-----------
+
+The client is proactive about the SmugMug rate limits (windowed,
+``X-RateLimit-Remaining`` / ``X-RateLimit-Reset`` headers):
+
+- Every response is inspected; a warning is logged when fewer than
+  ``RATE_LIMIT_WARNING_THRESHOLD`` (10) requests remain in the current window.
+- HTTP 429 raises :class:`RateLimitError` (a ``SmugMugError`` subclass) and is
+  retried up to 5 times, sleeping exactly the ``Retry-After`` value (capped at
+  ``RATE_LIMIT_MAX_SLEEP`` = 60 s) between attempts.
+- The same handling applies to image uploads (up to 4 attempts) and to
+  ``_post``/``_patch``/``_delete`` (previously these had no retry at all).
+- After retries are exhausted the ``RateLimitError`` propagates so callers
+  can decide how to proceed.
