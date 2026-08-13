@@ -74,6 +74,23 @@ def test_sanitize_per_segment_not_whole_path():
     assert album == "2007"
 
 
+@pytest.mark.parametrize(
+    "full_path,expected_parent,expected_album",
+    [
+        ("/Italy/2007", "Italy", "2007"),
+        ("Italy/2007/", "Italy", "2007"),
+        ("/Album/", "Album", "Album"),
+        ("/Album", "Album", "Album"),
+    ],
+)
+def test_split_album_path_ignores_leading_trailing_slashes(
+    full_path, expected_parent, expected_album
+):
+    parent, album = _split_album_path(full_path)
+    assert parent == expected_parent
+    assert album == expected_album
+
+
 def test_list_upload_files_sorts_and_skips_hidden(tmp_path):
     (tmp_path / "b.jpg").write_bytes(b"")
     (tmp_path / "a.png").write_bytes(b"")

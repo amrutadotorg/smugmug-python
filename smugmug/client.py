@@ -42,8 +42,11 @@ def _split_album_path(full_path: str) -> tuple[str, str]:
 
     Sanitization happens per segment so the "/" separator survives (replacing it
     inside the whole path would collapse the hierarchy into a single name).
+    Leading/trailing slashes are ignored so "Parent/Album/", "/Parent/Album" and
+    "/Album/" work like their slash-less counterparts.
     """
-    parts = [_sanitize_path_segment(p).strip() for p in str(full_path).split("/")]
+    full_path = str(full_path).strip("/")
+    parts = [_sanitize_path_segment(p).strip() for p in full_path.split("/")]
     if len(parts) > 2:
         raise SmugMugError(
             f"Expected 'parent/album' path, got {len(parts)} segments: {full_path!r}"
@@ -90,10 +93,15 @@ def _parse_retry_after(r) -> float | None:
     raw = r.headers.get("Retry-After")
     if not raw:
         return None
+    # fmt: off
+    # Parenthesized on purpose: PEP 758 dropped the parens only without "as";
+    # adding "as e" would silently break the unparenthesized form. ruff's
+    # formatter strips the parens for 3.14 targets, hence the fmt directives.
     try:
         return float(raw)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return None
+    # fmt: on
 
 
 def _rate_limit_error(r, context: str) -> RateLimitError:
@@ -296,16 +304,21 @@ class SmugMugClient:
         if r.status_code == 429:
             raise _rate_limit_error(r, f"DELETE {uri}")
         _log_rate_limit_headers(r)
-        return r.status_code in (200, 201)
+        return r.status_code in (200, 201, 204)
 
     # --- Node operations ---
 
     def get_node_children(
         self, node_uri: str, count: int = 500
     ) -> list[dict[str, Any]]:
-        """List children of a node. Propagates errors — callers must handle SmugMugError."""
-        data = self._get(f"{node_uri}!children", {"count": count})
-        return data.get("Response", {}).get("Node", [])
+        """List all children of a node (paginated). Propagates errors — callers must handle SmugMugError."""
+        children: list[dict[str, Any]] = []
+        next_page_uri: str | None = f"{node_uri}!children"
+        while next_page_uri:
+            data = self._get(next_page_uri, {"count": count})
+            children.extend(data.get("Response", {}).get("Node", []))
+            next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
+        return children
 
     def get_node(self, node_uri: str) -> dict[str, Any] | None:
         try:
@@ -513,6 +526,12 @@ class SmugMugClient:
     def upload_new_only(
         self, album_uri: str, folder_path: Path, extensions: set[str] | None = None
     ) -> tuple[list[dict[str, str]], int]:
+        """Upload files not already in the album (MD5 dedup).
+
+        The whole file is loaded into memory for hashing and upload — fine for
+        typical JPEGs, but budget RAM when uploading large video/RAW files,
+        especially with parallel ``upload_folder``.
+        """
         try:
             existing_hashes = self.get_album_image_hashes(album_uri)
         except (SmugMugError, requests.exceptions.RequestException) as e:
@@ -555,6 +574,7 @@ class SmugMugClient:
     # --- Upload ---
 
     def upload_file(self, album_uri: str, file_path: Path) -> dict[str, str] | None:
+        """Upload a single file. Loads it fully into memory (see upload_new_only)."""
         with open(file_path, "rb") as f:
             image_data = f.read()
         return self._upload_bytes(album_uri, file_path.name, image_data)

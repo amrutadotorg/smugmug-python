@@ -26,13 +26,17 @@ class FakeResp:
 
 
 class FakeSession(OAuth1Session):
-    """Session stub — only ``get`` is used by the tests, no auth internals."""
+    """Session stub — only ``get``/``delete`` are used by the tests, no auth internals."""
 
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
 
     def get(self, *args, **kwargs):
+        self.calls += 1
+        return self.responses[min(self.calls, len(self.responses)) - 1]
+
+    def delete(self, *args, **kwargs):
         self.calls += 1
         return self.responses[min(self.calls, len(self.responses)) - 1]
 
@@ -223,3 +227,56 @@ def test_move_collect_returns_true_when_job_completes(monkeypatch):
         client._move_collect_chunked("/api/v2/album/to", ["/img/1"], "collectimages")
         is True
     )
+
+
+def test_get_node_children_paginates(monkeypatch):
+    """Children beyond the first page must not be dropped."""
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={
+                    "Response": {
+                        "Node": [{"Name": "a"}, {"Name": "b"}],
+                        "Pages": {"NextPage": "/api/v2/node/x!children"},
+                    }
+                },
+            ),
+            FakeResp(
+                200,
+                {},
+                json_data={"Response": {"Node": [{"Name": "c"}]}},
+            ),
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    children = client.get_node_children("/api/v2/node/x", count=2)
+
+    assert [c["Name"] for c in children] == ["a", "b", "c"]
+    assert session.calls == 2
+
+
+def test_get_node_children_single_page(monkeypatch):
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={"Response": {"Node": [{"Name": "a"}]}},
+            ),
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert [c["Name"] for c in client.get_node_children("/api/v2/node/x")] == ["a"]
+    assert session.calls == 1
+
+
+def test_delete_accepts_204(monkeypatch):
+    """SmugMug may answer DELETE with 204 No Content — that is success."""
+    session = FakeSession([FakeResp(204, {}, text="")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client._delete("/api/v2/album/x") is True
