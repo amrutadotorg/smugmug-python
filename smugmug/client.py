@@ -37,6 +37,9 @@ ILLEGAL_PATH_CHARS = re.compile(r'[\/\\:*?"<>|]')
 FOLDER_SORT_METHOD = 3
 FOLDER_SORT_DIRECTION = 1
 
+# Pause between sequential uploads (gentle on rate limits).
+_SEQUENTIAL_UPLOAD_PACE = 0.2
+
 
 def _sanitize_path_segment(name: str) -> str:
     return ILLEGAL_PATH_CHARS.sub("-", name)
@@ -71,6 +74,36 @@ def _list_upload_files(
     if extensions:
         files = [f for f in files if f.suffix.lower() in extensions]
     return sorted(files, key=lambda x: x.name.lower())
+
+
+def _album_uri_from_node(node: dict[str, Any], node_uri: str) -> str:
+    """Extract the album URI a node points at, or fail loudly if it is not an album."""
+    album_uri = node.get("Uris", {}).get("Album", {}).get("Uri")
+    if not album_uri:
+        raise SmugMugError(f"Node {node_uri} is not an album (no Album.Uri)")
+    return album_uri
+
+
+def _filter_duplicates(
+    files: list[Path],
+    existing_md5s: set[str],
+    existing_names: set[str],
+) -> tuple[list[Path], int]:
+    """Split files into (to_upload, skipped) by MD5 against the album's images."""
+    kept: list[Path] = []
+    skipped = 0
+    for fp in files:
+        local_md5 = hashlib.md5(fp.read_bytes()).hexdigest()
+        if local_md5 in existing_md5s:
+            logger.debug(f"Dup skip: {fp.name} (MD5: {local_md5[:8]}...)")
+            skipped += 1
+            continue
+        if fp.name in existing_names:
+            logger.warning(
+                f"Filename exists but MD5 differs: {fp.name} (will re-upload)"
+            )
+        kept.append(fp)
+    return kept, skipped
 
 
 class SmugMugError(Exception):
@@ -262,7 +295,9 @@ class SmugMugClient:
                 status_code=r.status_code,
             )
         _log_rate_limit_headers(r)
-        return r.json()
+        # Unwrap the "Response" envelope once here so callers never have to
+        # know the transport shape (fixing this in one place if it changes).
+        return r.json().get("Response", {})
 
     @_SESSION_RETRY
     def _post(
@@ -285,7 +320,7 @@ class SmugMugClient:
                 status_code=r.status_code,
             )
         _log_rate_limit_headers(r)
-        return r.json()
+        return r.json().get("Response", {})
 
     @_SESSION_RETRY
     def _patch(self, uri: str, payload: dict[str, Any]) -> bool:
@@ -321,8 +356,8 @@ class SmugMugClient:
         next_page_uri: str | None = f"{node_uri}!children"
         while next_page_uri:
             data = self._get(next_page_uri, {"count": count})
-            children.extend(data.get("Response", {}).get("Node", []))
-            next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
+            children.extend(data.get("Node", []))
+            next_page_uri = data.get("Pages", {}).get("NextPage")
         return children
 
     def get_node(
@@ -330,7 +365,7 @@ class SmugMugClient:
     ) -> dict[str, Any] | None:
         try:
             data = self._get(node_uri)
-            return data.get("Response", {}).get("Node")
+            return data.get("Node")
         except SmugMugError:
             if raise_on_error:
                 raise
@@ -341,7 +376,7 @@ class SmugMugClient:
     ) -> dict[str, Any] | None:
         try:
             data = self._get(album_uri)
-            return data.get("Response", {}).get("Album")
+            return data.get("Album")
         except SmugMugError:
             if raise_on_error:
                 raise
@@ -386,7 +421,7 @@ class SmugMugClient:
 
         try:
             result = self._post(f"{parent_node_uri}!children", data=payload)
-            new_uri = result["Response"]["Node"]["Uri"]
+            new_uri = result["Node"]["Uri"]
             logger.info(f'Created {node_type} "{node_name}" → {new_uri}')
             return new_uri
         except SmugMugError as e:
@@ -405,11 +440,8 @@ class SmugMugClient:
             raise
 
     def get_album_uri(self, node_uri: str) -> str:
-        node = self._get(node_uri).get("Response", {}).get("Node", {})
-        album_uri = node.get("Uris", {}).get("Album", {}).get("Uri")
-        if not album_uri:
-            raise SmugMugError(f"Node {node_uri} is not an album (no Album.Uri)")
-        return album_uri
+        node = self._get(node_uri).get("Node", {})
+        return _album_uri_from_node(node, node_uri)
 
     def get_weburi(self, node_uri: str) -> str | None:
         node = self.get_node(node_uri)
@@ -417,7 +449,7 @@ class SmugMugClient:
 
     def image_count(self, album_uri: str) -> int:
         data = self._get(album_uri, params={"_filter": "ImageCount"})
-        count = data.get("Response", {}).get("Album", {}).get("ImageCount")
+        count = data.get("Album", {}).get("ImageCount")
         if count is None:
             raise SmugMugError(f"Album {album_uri} has no ImageCount")
         return count
@@ -427,10 +459,8 @@ class SmugMugClient:
         next_page_uri: str | None = f"{album_uri}!images"
         while next_page_uri:
             data = self._get(next_page_uri, {"count": 500})
-            uris.extend(
-                x["Uri"] for x in data.get("Response", {}).get("AlbumImage", [])
-            )
-            next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
+            uris.extend(x["Uri"] for x in data.get("AlbumImage", []))
+            next_page_uri = data.get("Pages", {}).get("NextPage")
         return uris
 
     # --- Album organization ---
@@ -487,7 +517,7 @@ class SmugMugClient:
         max_wait: float = 120.0,
     ) -> bool:
         """Poll an async job until it completes. True only on "Completed"."""
-        job_uri = response.get("Response", {}).get("Uri", "")
+        job_uri = response.get("Uri", "")
         if not job_uri:
             logger.warning("Async job response has no Uri to poll")
             return False
@@ -495,7 +525,7 @@ class SmugMugClient:
         while elapsed < max_wait:
             try:
                 status_resp = self._get(job_uri)
-                status = status_resp.get("Response", {}).get("Status", "")
+                status = status_resp.get("Status", "")
                 if status == "Completed":
                     logger.debug(f"Async job {job_uri} completed in {elapsed:.0f}s")
                     return True
@@ -527,7 +557,7 @@ class SmugMugClient:
         next_page_uri: str | None = f"{album_uri}!images"
         while next_page_uri:
             data = self._get(next_page_uri, {"count": 500, "_expand": "Image"})
-            for img in data.get("Response", {}).get("AlbumImage", []):
+            for img in data.get("AlbumImage", []):
                 images.append(
                     {
                         "FileName": img["FileName"],
@@ -536,56 +566,67 @@ class SmugMugClient:
                         "ImageKey": img.get("ImageKey", ""),
                     }
                 )
-            next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
+            next_page_uri = data.get("Pages", {}).get("NextPage")
         return images
 
-    def upload_new_only(
-        self, album_uri: str, folder_path: Path, extensions: set[str] | None = None
+    def upload(
+        self,
+        album_uri: str,
+        folder_path: Path,
+        *,
+        dedup: bool = False,
+        max_workers: int = 1,
+        extensions: set[str] | None = None,
     ) -> tuple[list[dict[str, str]], int]:
-        """Upload files not already in the album (MD5 dedup).
+        """Upload files from a folder, optionally skipping duplicates.
 
-        The whole file is loaded into memory for hashing and upload — fine for
-        typical JPEGs, but budget RAM when uploading large video/RAW files,
-        especially with parallel ``upload_folder``.
+        ``dedup`` filters out files whose MD5 already exists in the album
+        (a pre-pass, before anything is uploaded). ``max_workers=1`` uploads
+        sequentially with a small pause; higher values upload in parallel.
+        Returns (uploaded, skipped).
+
+        The whole file is loaded into memory for hashing and upload — fine
+        for typical JPEGs, but budget RAM when uploading large video/RAW
+        files, especially in parallel.
         """
-        try:
-            existing_hashes = self.get_album_image_hashes(album_uri)
-        except (SmugMugError, requests.exceptions.RequestException) as e:
-            logger.error(
-                f"Cannot fetch existing images for dedup, aborting upload: {e}"
-            )
+        files = _list_upload_files(folder_path, extensions)
+        if not files:
             return [], 0
 
-        existing_md5s = {h["ArchivedMD5"] for h in existing_hashes}
-        existing_names = {h["FileName"] for h in existing_hashes}
-
-        all_files = _list_upload_files(folder_path, extensions)
-        if not all_files:
-            return [], 0
-
-        uploaded: list[dict[str, str]] = []
         skipped = 0
-        for fp in all_files:
-            image_data = fp.read_bytes()
-            local_md5 = hashlib.md5(image_data).hexdigest()
-            if local_md5 in existing_md5s:
-                logger.debug(f"Dup skip: {fp.name} (MD5: {local_md5[:8]}...)")
-                skipped += 1
-                continue
-            if fp.name in existing_names:
-                logger.warning(
-                    f"Filename exists but MD5 differs: {fp.name} (will re-upload)"
+        if dedup:
+            try:
+                existing_hashes = self.get_album_image_hashes(album_uri)
+            except (SmugMugError, requests.exceptions.RequestException) as e:
+                logger.error(
+                    f"Cannot fetch existing images for dedup, aborting upload: {e}"
                 )
-            result = self._upload_bytes(album_uri, fp.name, image_data)
-            if result:
-                result["file_name"] = fp.name
-                uploaded.append(result)
-            time.sleep(0.2)
+                return [], 0
+            existing_md5s = {h["ArchivedMD5"] for h in existing_hashes}
+            existing_names = {h["FileName"] for h in existing_hashes}
+            files, skipped = _filter_duplicates(files, existing_md5s, existing_names)
+
+        if max_workers == 1:
+            uploaded = self._upload_sequential(album_uri, files)
+        else:
+            uploaded = self._upload_parallel(album_uri, files, max_workers)
 
         logger.info(
-            f"Uploaded {len(uploaded)} new, skipped {skipped} duplicates from {folder_path.name}"
+            f"Uploaded {len(uploaded)}/{len(files)} files, skipped {skipped} "
+            f"from {folder_path.name}"
         )
         return uploaded, skipped
+
+    def _upload_sequential(
+        self, album_uri: str, files: list[Path]
+    ) -> list[dict[str, str]]:
+        uploaded: list[dict[str, str]] = []
+        for fp in files:
+            result = self.upload_file(album_uri, fp)
+            if result:
+                uploaded.append(result)
+            time.sleep(_SEQUENTIAL_UPLOAD_PACE)
+        return uploaded
 
     # --- Upload ---
 
@@ -659,23 +700,18 @@ class SmugMugClient:
             "file_name": file_name,
         }
 
-    def upload_folder(
-        self,
-        album_uri: str,
-        folder_path: Path,
-        max_workers: int = 4,
-        extensions: set[str] | None = None,
-    ) -> list[dict[str, str]]:
-        files = _list_upload_files(folder_path, extensions)
-        if not files:
-            logger.warning(f"No files in {folder_path}")
-            return []
-
-        logger.info(
-            f"Uploading {len(files)} files from {folder_path.name} ({max_workers} workers)"
+    def upload_new_only(
+        self, album_uri: str, folder_path: Path, extensions: set[str] | None = None
+    ) -> tuple[list[dict[str, str]], int]:
+        """Upload files not already in the album (MD5 dedup). See ``upload(dedup=True)``."""
+        return self.upload(
+            album_uri, folder_path, dedup=True, max_workers=1, extensions=extensions
         )
-        uploaded: list[dict[str, str]] = []
 
+    def _upload_parallel(
+        self, album_uri: str, files: list[Path], max_workers: int
+    ) -> list[dict[str, str]]:
+        uploaded: list[dict[str, str]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(self.upload_file, album_uri, fp): fp.name
@@ -689,11 +725,23 @@ class SmugMugClient:
                         uploaded.append(result)
                 except (SmugMugError, requests.exceptions.RequestException) as e:
                     logger.error(f"Upload thread failed for {fname}: {e}")
-
-        logger.info(
-            f"Uploaded {len(uploaded)}/{len(files)} files from {folder_path.name}"
-        )
         return uploaded
+
+    def upload_folder(
+        self,
+        album_uri: str,
+        folder_path: Path,
+        max_workers: int = 4,
+        extensions: set[str] | None = None,
+    ) -> list[dict[str, str]]:
+        """Parallel upload of every file in a folder. See ``upload(max_workers=N)``."""
+        return self.upload(
+            album_uri,
+            folder_path,
+            dedup=False,
+            max_workers=max_workers,
+            extensions=extensions,
+        )[0]
 
     # --- Bulk operations ---
 
@@ -702,7 +750,7 @@ class SmugMugClient:
         for child in self.get_node_children(parent_node_uri):
             if child.get("Type") != "Album":
                 continue
-            album_uri = child["Uris"]["Album"]["Uri"]
+            album_uri = _album_uri_from_node(child, child.get("Uri", "?"))
             try:
                 cnt = self.image_count(album_uri)
             except SmugMugError:

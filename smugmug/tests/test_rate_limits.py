@@ -8,6 +8,7 @@ from requests_oauthlib import OAuth1Session
 
 from smugmug import RateLimitError, SmugMugClient, SmugMugError
 from smugmug.client import (
+    _filter_duplicates,
     _log_rate_limit_headers,
     _parse_retry_after,
     _rate_limit_error,
@@ -117,7 +118,11 @@ def test_get_retries_on_429_honoring_retry_after(monkeypatch):
     session = FakeSession(
         [
             FakeResp(429, {"Retry-After": "1"}, text="rate limited"),
-            FakeResp(200, {"X-RateLimit-Remaining": "50"}, json_data={"ok": True}),
+            FakeResp(
+                200,
+                {"X-RateLimit-Remaining": "50"},
+                json_data={"Response": {"ok": True}},
+            ),
         ]
     )
     client = SmugMugClient(session, root_node_uri="")
@@ -159,7 +164,11 @@ def test_get_retries_on_server_errors(monkeypatch):
     session = FakeSession(
         [
             FakeResp(500, {}, text="boom"),
-            FakeResp(200, {"X-RateLimit-Remaining": "50"}, json_data={"ok": True}),
+            FakeResp(
+                200,
+                {"X-RateLimit-Remaining": "50"},
+                json_data={"Response": {"ok": True}},
+            ),
         ]
     )
     client = SmugMugClient(session, root_node_uri="")
@@ -180,7 +189,7 @@ def test_poll_async_job_returns_true_on_completed(monkeypatch):
     )
     client = _job_client(session)
 
-    assert client._poll_async_job({"Response": {"Uri": "/api/v2/job/x"}}) is True
+    assert client._poll_async_job({"Uri": "/api/v2/job/x"}) is True
 
 
 def test_poll_async_job_returns_false_on_failed(monkeypatch):
@@ -191,7 +200,7 @@ def test_poll_async_job_returns_false_on_failed(monkeypatch):
     )
     client = _job_client(session)
 
-    assert client._poll_async_job({"Response": {"Uri": "/api/v2/job/x"}}) is False
+    assert client._poll_async_job({"Uri": "/api/v2/job/x"}) is False
 
 
 def test_poll_async_job_returns_false_on_timeout(monkeypatch):
@@ -204,7 +213,7 @@ def test_poll_async_job_returns_false_on_timeout(monkeypatch):
 
     assert (
         client._poll_async_job(
-            {"Response": {"Uri": "/api/v2/job/x"}}, poll_interval=0.1, max_wait=0.25
+            {"Uri": "/api/v2/job/x"}, poll_interval=0.1, max_wait=0.25
         )
         is False
     )
@@ -340,3 +349,86 @@ def test_get_node_raise_on_error():
 
     with pytest.raises(SmugMugError):
         client.get_node("/api/v2/node/x", raise_on_error=True)
+
+
+UPLOAD_OK = {
+    "stat": "ok",
+    "Image": {"URL": "u", "ImageUri": "/api/v2/image/x", "UploadKey": "k"},
+}
+
+
+def test_filter_duplicates_skips_by_md5(tmp_path):
+    keep = tmp_path / "keep.jpg"
+    dup = tmp_path / "dup.jpg"
+    keep.write_bytes(b"unique")
+    dup.write_bytes(b"same")
+
+    kept, skipped = _filter_duplicates(
+        [keep, dup], {hashlib.md5(b"same").hexdigest()}, set()
+    )
+
+    assert kept == [keep]
+    assert skipped == 1
+
+
+def test_upload_parallel_uploads_all_files(monkeypatch, tmp_path):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+    (tmp_path / "a.jpg").write_bytes(b"a")
+    (tmp_path / "b.jpg").write_bytes(b"b")
+
+    session = FakeSession([FakeResp(200, {}, json_data=UPLOAD_OK)])
+    client = SmugMugClient(session, root_node_uri="")
+
+    uploaded, skipped = client.upload(
+        "/api/v2/album/x", tmp_path, dedup=False, max_workers=2
+    )
+
+    assert [r["file_name"] for r in uploaded] == ["a.jpg", "b.jpg"]
+    assert skipped == 0
+
+
+def test_upload_dedup_skips_existing_md5(monkeypatch, tmp_path):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+    (tmp_path / "keep.jpg").write_bytes(b"new")
+    dup = tmp_path / "dup.jpg"
+    dup.write_bytes(b"existing")
+
+    hashes_resp = {
+        "Response": {
+            "AlbumImage": [
+                {
+                    "FileName": "dup.jpg",
+                    "ArchivedMD5": hashlib.md5(b"existing").hexdigest(),
+                    "Uri": "/api/v2/image/1",
+                    "ImageKey": "k",
+                }
+            ]
+        }
+    }
+    session = FakeSession(
+        [
+            FakeResp(200, {}, json_data=hashes_resp),
+            FakeResp(200, {}, json_data=UPLOAD_OK),
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    uploaded, skipped = client.upload(
+        "/api/v2/album/x", tmp_path, dedup=True, max_workers=1
+    )
+
+    assert [r["file_name"] for r in uploaded] == ["keep.jpg"]
+    assert skipped == 1
+
+
+def test_upload_sequential_is_paced(monkeypatch, tmp_path):
+    slept = []
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: slept.append(s))
+    (tmp_path / "a.jpg").write_bytes(b"a")
+
+    session = FakeSession([FakeResp(200, {}, json_data=UPLOAD_OK)])
+    client = SmugMugClient(session, root_node_uri="")
+
+    client.upload("/api/v2/album/x", tmp_path, dedup=False, max_workers=1)
+
+    assert slept == [0.2]
