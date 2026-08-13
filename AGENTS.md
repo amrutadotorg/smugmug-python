@@ -15,6 +15,7 @@ as `~/SCRIPTS/soundcloud-python` (standalone repo, installed into
 │   ├── client.py       # OAuth1 API v2 client (upload, dedup, albums, nodes)
 │   └── tests/
 │       ├── test_paths.py       # Unit tests — path splitting/sanitization (no API)
+│       ├── test_rate_limits.py # Unit tests — retry, rate limits, async jobs, upload (no API)
 │       └── test_integration.py # Live API tests (marker: integration)
 ├── pyproject.toml      # hatchling, name "smugmug"
 └── README.rst
@@ -29,11 +30,14 @@ as `~/SCRIPTS/soundcloud-python` (standalone repo, installed into
 - **Idempotent album creation**: `get_album_else_create` splits the
   `"parent/album"` path BEFORE sanitizing each segment — never sanitize
   the whole path first (that collapses the hierarchy).
-- **Dedup**: `upload_new_only` and `get_album_image_hashes` (ArchivedMD5)
-  are the dedup primitives; `move_image_uris` / `collect_image_uris` move
-  or collect specific images (idempotent flows).
+- **Dedup**: `upload(..., dedup=True)` and `get_album_image_hashes`
+  (ArchivedMD5) are the dedup primitives; `upload_new_only` is a thin
+  wrapper; `move_image_uris` / `collect_image_uris` move or collect specific
+  images (idempotent flows).
 - Async job endpoints (`moveimages`/`collectimages`) may take > 2 minutes
-  server-side; `_poll_async_job` waits up to 120 s, then proceeds.
+  server-side; `_poll_async_job` polls up to 120 s and returns `bool` —
+  `move_images`/`collect_images` return `False` when a job fails or times
+  out (they do not silently report success).
 
 ## Commands
 
