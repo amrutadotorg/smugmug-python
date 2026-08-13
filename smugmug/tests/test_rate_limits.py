@@ -1,11 +1,11 @@
-"""Unit tests for rate-limit handling (no API access)."""
+"""Unit tests for rate-limit handling and retry/async-job behavior (no API access)."""
 
 import logging
 
 import pytest
 from requests_oauthlib import OAuth1Session
 
-from smugmug import RateLimitError, SmugMugClient
+from smugmug import RateLimitError, SmugMugClient, SmugMugError
 from smugmug.client import (
     _log_rate_limit_headers,
     _parse_retry_after,
@@ -126,3 +126,100 @@ def test_get_raises_rate_limit_error_after_retries_exhausted(monkeypatch):
     with pytest.raises(RateLimitError):
         client._get("/api/v2/album/x")
     assert session.calls == 5
+
+
+def test_get_does_not_retry_on_client_errors(monkeypatch):
+    """404 is not retryable — one attempt, and the error carries the status code."""
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession([FakeResp(404, {}, text="not found")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    with pytest.raises(SmugMugError) as excinfo:
+        client._get("/api/v2/album/nonexistent99")
+    assert excinfo.value.status_code == 404
+    assert session.calls == 1
+
+
+def test_get_retries_on_server_errors(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [
+            FakeResp(500, {}, text="boom"),
+            FakeResp(200, {"X-RateLimit-Remaining": "50"}, json_data={"ok": True}),
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client._get("/api/v2/album/x") == {"ok": True}
+    assert session.calls == 2
+
+
+def _job_client(session):
+    return SmugMugClient(session, root_node_uri="")
+
+
+def test_poll_async_job_returns_true_on_completed(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [FakeResp(200, {}, json_data={"Response": {"Status": "Completed"}})]
+    )
+    client = _job_client(session)
+
+    assert client._poll_async_job({"Response": {"Uri": "/api/v2/job/x"}}) is True
+
+
+def test_poll_async_job_returns_false_on_failed(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [FakeResp(200, {}, json_data={"Response": {"Status": "Failed"}})]
+    )
+    client = _job_client(session)
+
+    assert client._poll_async_job({"Response": {"Uri": "/api/v2/job/x"}}) is False
+
+
+def test_poll_async_job_returns_false_on_timeout(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [FakeResp(200, {}, json_data={"Response": {"Status": "Pending"}})]
+    )
+    client = _job_client(session)
+
+    assert (
+        client._poll_async_job(
+            {"Response": {"Uri": "/api/v2/job/x"}}, poll_interval=0.1, max_wait=0.25
+        )
+        is False
+    )
+
+
+def test_move_collect_marks_failure_when_job_fails(monkeypatch):
+    """all_ok must reflect the async job outcome, not just the POST."""
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    client = _job_client(FakeSession([]))
+    monkeypatch.setattr(client, "_post", lambda *a, **k: {"Response": {"Uri": "/job"}})
+    monkeypatch.setattr(client, "_poll_async_job", lambda *a, **k: False)
+
+    assert (
+        client._move_collect_chunked("/api/v2/album/to", ["/img/1"], "moveimages")
+        is False
+    )
+
+
+def test_move_collect_returns_true_when_job_completes(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    client = _job_client(FakeSession([]))
+    monkeypatch.setattr(client, "_post", lambda *a, **k: {"Response": {"Uri": "/job"}})
+    monkeypatch.setattr(client, "_poll_async_job", lambda *a, **k: True)
+
+    assert (
+        client._move_collect_chunked("/api/v2/album/to", ["/img/1"], "collectimages")
+        is True
+    )

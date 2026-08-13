@@ -19,7 +19,7 @@ import requests
 from requests_oauthlib import OAuth1Session
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
 )
 
@@ -44,13 +44,33 @@ def _split_album_path(full_path: str) -> tuple[str, str]:
     inside the whole path would collapse the hierarchy into a single name).
     """
     parts = [_sanitize_path_segment(p).strip() for p in str(full_path).split("/")]
+    if len(parts) > 2:
+        raise SmugMugError(
+            f"Expected 'parent/album' path, got {len(parts)} segments: {full_path!r}"
+        )
     parent_name = parts[0]
     album_name = parts[1] if len(parts) > 1 else parts[0]
     return parent_name, album_name
 
 
+def _list_upload_files(
+    folder_path: Path, extensions: set[str] | None = None
+) -> list[Path]:
+    """List uploadable files in a folder, sorted by name (optionally filtered)."""
+    files = [
+        f for f in folder_path.iterdir() if f.is_file() and not f.name.startswith(".")
+    ]
+    if extensions:
+        files = [f for f in files if f.suffix.lower() in extensions]
+    return sorted(files, key=lambda x: x.name.lower())
+
+
 class SmugMugError(Exception):
-    pass
+    """Base error. Optionally carries the HTTP status code that caused it."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class RateLimitError(SmugMugError):
@@ -103,19 +123,53 @@ def _wait_after_rate_limit(retry_state) -> float:
     return min(2**retry_state.attempt_number, 10.0)
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """True only for errors a retry could plausibly fix.
+
+    Rate limits and network errors yes; 4xx client errors (bad token, not
+    found, conflict) would fail identically on every attempt, so retrying
+    them only adds latency. Unknown status codes are treated as fatal.
+    """
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(
+        exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+    ):
+        return True
+    return (
+        isinstance(exc, SmugMugError)
+        and exc.status_code is not None
+        and exc.status_code >= 500
+    )
+
+
 _SESSION_RETRY = retry(
-    retry=retry_if_exception_type(
-        (
-            RateLimitError,
-            SmugMugError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        )
-    ),
+    retry=retry_if_exception(_is_retryable),
     wait=_wait_after_rate_limit,
     stop=stop_after_attempt(5),
     reraise=True,
 )
+
+_UPLOAD_MAX_ATTEMPTS = 4
+
+
+def _make_upload_retry(file_name: str):
+    """Upload-specific retry: same predicate as _SESSION_RETRY, logged per file."""
+
+    def _log_retry(retry_state) -> None:
+        if retry_state.outcome and retry_state.outcome.failed:
+            logger.warning(
+                f"Upload {file_name}: {retry_state.outcome.exception()}, "
+                f"retry {retry_state.attempt_number - 1}/{_UPLOAD_MAX_ATTEMPTS - 1}"
+            )
+
+    return retry(
+        retry=retry_if_exception(_is_retryable),
+        wait=_wait_after_rate_limit,
+        stop=stop_after_attempt(_UPLOAD_MAX_ATTEMPTS),
+        reraise=True,
+        after=_log_retry,
+    )
 
 
 class SmugMugClient:
@@ -190,7 +244,10 @@ class SmugMugClient:
         if r.status_code == 429:
             raise _rate_limit_error(r, f"GET {uri}")
         if r.status_code not in (200, 201):
-            raise SmugMugError(f"GET {uri}: HTTP {r.status_code} — {r.text[:300]}")
+            raise SmugMugError(
+                f"GET {uri}: HTTP {r.status_code} — {r.text[:300]}",
+                status_code=r.status_code,
+            )
         _log_rate_limit_headers(r)
         return r.json()
 
@@ -210,7 +267,10 @@ class SmugMugClient:
         if r.status_code == 429:
             raise _rate_limit_error(r, f"POST {uri}")
         if r.status_code not in (200, 201):
-            raise SmugMugError(f"POST {uri}: HTTP {r.status_code} — {r.text[:300]}")
+            raise SmugMugError(
+                f"POST {uri}: HTTP {r.status_code} — {r.text[:300]}",
+                status_code=r.status_code,
+            )
         _log_rate_limit_headers(r)
         return r.json()
 
@@ -267,6 +327,7 @@ class SmugMugClient:
         node_type: str,
         node_name: str,
         node_password: str | None = None,
+        privacy: str = "Public",
     ) -> str:
         try:
             children = self.get_node_children(parent_node_uri)
@@ -285,7 +346,7 @@ class SmugMugClient:
         payload: dict[str, Any] = {
             "Type": node_type,
             "Name": node_name,
-            "Privacy": "Public",
+            "Privacy": privacy,
         }
         if node_type == "Folder":
             payload["SortMethod"] = 3
@@ -300,38 +361,37 @@ class SmugMugClient:
             logger.info(f'Created {node_type} "{node_name}" → {new_uri}')
             return new_uri
         except SmugMugError as e:
-            if "Conflict" in str(e) or "409" in str(e):
+            if e.status_code == 409:
                 try:
-                    r = self.session.get(
-                        f"{API_BASE}{parent_node_uri}!children",
-                        headers=self.headers,
-                        params={"count": 100},
-                        timeout=REQUEST_TIMEOUT,
-                    )
-                    for child in r.json().get("Response", {}).get("Node", []):
+                    for child in self.get_node_children(parent_node_uri):
                         if child.get("Name") == node_name:
                             return child["Uri"]
                 except (
                     SmugMugError,
                     requests.exceptions.RequestException,
-                    requests.exceptions.Timeout,
-                ) as e:
+                ) as conflict_e:
                     logger.warning(
-                        f"Conflict resolution retry failed for '{node_name}': {e}"
+                        f"Conflict resolution retry failed for '{node_name}': {conflict_e}"
                     )
             raise
 
     def get_album_uri(self, node_uri: str) -> str:
-        node = self._get(node_uri)
-        return node["Response"]["Node"]["Uris"]["Album"]["Uri"]
+        node = self._get(node_uri).get("Response", {}).get("Node", {})
+        album_uri = node.get("Uris", {}).get("Album", {}).get("Uri")
+        if not album_uri:
+            raise SmugMugError(f"Node {node_uri} is not an album (no Album.Uri)")
+        return album_uri
 
     def get_weburi(self, node_uri: str) -> str | None:
         node = self.get_node(node_uri)
-        return node["WebUri"] if node else None
+        return node.get("WebUri") if node else None
 
     def image_count(self, album_uri: str) -> int:
-        data = self._get(f"{album_uri}", params={"_filter": "ImageCount"})
-        return data["Response"]["Album"]["ImageCount"]
+        data = self._get(album_uri, params={"_filter": "ImageCount"})
+        count = data.get("Response", {}).get("Album", {}).get("ImageCount")
+        if count is None:
+            raise SmugMugError(f"Album {album_uri} has no ImageCount")
+        return count
 
     def get_album_images(self, album_uri: str) -> list[str]:
         uris: list[str] = []
@@ -383,7 +443,8 @@ class SmugMugClient:
                 logger.info(
                     f"{endpoint} chunk {i}: {len(chunk)} images → {to_album_uri}"
                 )
-                self._poll_async_job(resp)
+                if not self._poll_async_job(resp):
+                    all_ok = False
             except SmugMugError as e:
                 logger.error(f"{endpoint} chunk failed: {e}")
                 all_ok = False
@@ -395,10 +456,12 @@ class SmugMugClient:
         response: dict[str, Any],
         poll_interval: float = 2.0,
         max_wait: float = 120.0,
-    ) -> None:
+    ) -> bool:
+        """Poll an async job until it completes. True only on "Completed"."""
         job_uri = response.get("Response", {}).get("Uri", "")
         if not job_uri:
-            return
+            logger.warning("Async job response has no Uri to poll")
+            return False
         elapsed = 0.0
         while elapsed < max_wait:
             try:
@@ -406,15 +469,16 @@ class SmugMugClient:
                 status = status_resp.get("Response", {}).get("Status", "")
                 if status == "Completed":
                     logger.debug(f"Async job {job_uri} completed in {elapsed:.0f}s")
-                    return
+                    return True
                 if status == "Failed":
                     logger.error(f"Async job {job_uri} failed")
-                    return
+                    return False
             except SmugMugError as e:
                 logger.warning(f"Async job poll failed for {job_uri}: {e}")
             time.sleep(poll_interval)
             elapsed += poll_interval
         logger.warning(f"Async job {job_uri} did not complete within {max_wait}s")
+        return False
 
     def delete_album(self, album_uri: str) -> bool:
         ok = self._delete(album_uri)
@@ -447,7 +511,7 @@ class SmugMugClient:
         return images
 
     def upload_new_only(
-        self, album_uri: str, folder_path: Path
+        self, album_uri: str, folder_path: Path, extensions: set[str] | None = None
     ) -> tuple[list[dict[str, str]], int]:
         try:
             existing_hashes = self.get_album_image_hashes(album_uri)
@@ -460,14 +524,7 @@ class SmugMugClient:
         existing_md5s = {h["ArchivedMD5"] for h in existing_hashes}
         existing_names = {h["FileName"] for h in existing_hashes}
 
-        all_files = sorted(
-            [
-                f
-                for f in folder_path.iterdir()
-                if f.is_file() and not f.name.startswith(".")
-            ],
-            key=lambda x: x.name.lower(),
-        )
+        all_files = _list_upload_files(folder_path, extensions)
         if not all_files:
             return [], 0
 
@@ -520,26 +577,7 @@ class SmugMugClient:
             "X-Smug-Version": "v2",
         }
 
-        @retry(
-            retry=retry_if_exception_type(
-                (
-                    RateLimitError,
-                    SmugMugError,
-                    requests.exceptions.ConnectionError,
-                    requests.exceptions.Timeout,
-                )
-            ),
-            wait=_wait_after_rate_limit,
-            stop=stop_after_attempt(4),
-            reraise=True,
-            after=lambda retry_state: (
-                logger.warning(
-                    f"Upload {file_name}: {retry_state.outcome.exception()}, retry {retry_state.attempt_number}/3"
-                )
-                if retry_state.outcome and retry_state.outcome.failed
-                else None
-            ),
-        )
+        @_make_upload_retry(file_name)
         def _do_upload():
             r = self.session.post(
                 UPLOAD_URL, headers=headers, data=image_data, timeout=UPLOAD_TIMEOUT
@@ -551,8 +589,13 @@ class SmugMugClient:
                 if result.get("stat") == "ok":
                     return result
             if 500 <= r.status_code < 600:
-                raise SmugMugError(f"HTTP {r.status_code} — {r.text[:200]}")
-            raise SmugMugError(f"HTTP {r.status_code}: {r.text[:200]}")
+                raise SmugMugError(
+                    f"HTTP {r.status_code} — {r.text[:200]}",
+                    status_code=r.status_code,
+                )
+            raise SmugMugError(
+                f"HTTP {r.status_code}: {r.text[:200]}", status_code=r.status_code
+            )
 
         try:
             result = _do_upload()
@@ -574,16 +617,13 @@ class SmugMugClient:
         }
 
     def upload_folder(
-        self, album_uri: str, folder_path: Path, max_workers: int = 4
+        self,
+        album_uri: str,
+        folder_path: Path,
+        max_workers: int = 4,
+        extensions: set[str] | None = None,
     ) -> list[dict[str, str]]:
-        files = sorted(
-            [
-                f
-                for f in folder_path.iterdir()
-                if f.is_file() and not f.name.startswith(".")
-            ],
-            key=lambda x: x.name.lower(),
-        )
+        files = _list_upload_files(folder_path, extensions)
         if not files:
             logger.warning(f"No files in {folder_path}")
             return []
