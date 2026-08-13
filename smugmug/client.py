@@ -269,7 +269,7 @@ class SmugMugClient:
         next_page_uri: str | None = f"{album_uri}!images"
         while next_page_uri:
             data = self._get(next_page_uri, {"count": 500})
-            uris.extend(x["Uri"] for x in data["Response"]["AlbumImage"])
+            uris.extend(x["Uri"] for x in data.get("Response", {}).get("AlbumImage", []))
             next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
         return uris
 
@@ -363,7 +363,7 @@ class SmugMugClient:
         next_page_uri: str | None = f"{album_uri}!images"
         while next_page_uri:
             data = self._get(next_page_uri, {"count": 500, "_expand": "Image"})
-            for img in data["Response"]["AlbumImage"]:
+            for img in data.get("Response", {}).get("AlbumImage", []):
                 images.append(
                     {
                         "FileName": img["FileName"],
