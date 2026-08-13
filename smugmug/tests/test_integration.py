@@ -124,3 +124,17 @@ class TestAlbumHierarchy:
 
         sm_client.delete_album(album_uri)
         sm_client._delete(folder["Uri"])
+
+
+class TestRenameAlbum:
+    def test_rename_album(self, sm_client, test_album_uri):
+        info = sm_client.get_album_info(test_album_uri)
+        old_name = info["Name"]
+
+        assert sm_client.rename_album(test_album_uri, f"{old_name}-renamed")
+        info = sm_client.get_album_info(test_album_uri)
+        assert info["Name"] == f"{old_name}-renamed"
+
+        assert sm_client.rename_album(test_album_uri, old_name)
+        info = sm_client.get_album_info(test_album_uri)
+        assert info["Name"] == old_name

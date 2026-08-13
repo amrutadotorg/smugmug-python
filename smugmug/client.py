@@ -674,6 +674,19 @@ class SmugMugClient:
             logger.warning(f"Failed to patch description of {node_uri}: {e}")
             return False
 
+    def rename_album(self, album_uri: str, new_name: str) -> bool:
+        """Rename an album. Returns True on success, False on failure."""
+        try:
+            ok = self._patch(album_uri, {"Name": new_name})
+        except SmugMugError as e:
+            logger.warning(f"Failed to rename {album_uri}: {e}")
+            return False
+        if ok:
+            logger.info(f"Renamed album {album_uri} → {new_name!r}")
+        else:
+            logger.warning(f"Failed to rename {album_uri}")
+        return ok
+
     # --- Deduplication ---
 
     def get_album_image_hashes(self, album_uri: str) -> list[dict[str, str]]:
