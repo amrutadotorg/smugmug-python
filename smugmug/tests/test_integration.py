@@ -52,22 +52,9 @@ def test_album_uri(sm_client):
     image_bytes = jpg_data.getvalue()
 
     md5_hash = hashlib.md5(image_bytes).hexdigest()
-    headers = {
-        "Content-Length": str(len(image_bytes)),
-        "Content-MD5": md5_hash,
-        "Content-Type": "image/jpeg",
-        "X-Smug-AlbumUri": album_uri,
-        "X-Smug-FileName": "_test.jpg",
-        "X-Smug-ResponseType": "JSON",
-        "X-Smug-Version": "v2",
-    }
-    r = sm_client.session.post(
-        "https://upload.smugmug.com/",
-        headers=headers,
-        data=image_bytes,
-        timeout=120,
-    )
-    assert r.status_code == 200, f"Test image upload failed: {r.status_code}"
+    result = sm_client._upload_bytes(album_uri, "_test.jpg", image_bytes)
+    assert result is not None, "Test image upload failed"
+    assert result["md5"] == md5_hash
 
     yield album_uri
 

@@ -1,5 +1,6 @@
 """Unit tests for rate-limit handling and retry/async-job behavior (no API access)."""
 
+import hashlib
 import logging
 
 import pytest
@@ -26,19 +27,26 @@ class FakeResp:
 
 
 class FakeSession(OAuth1Session):
-    """Session stub — only ``get``/``delete`` are used by the tests, no auth internals."""
+    """Session stub — only ``get``/``post``/``delete`` are used by the tests, no auth internals."""
 
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        self.last_kwargs: dict | None = None
+
+    def _next(self):
+        self.calls += 1
+        return self.responses[min(self.calls, len(self.responses)) - 1]
 
     def get(self, *args, **kwargs):
-        self.calls += 1
-        return self.responses[min(self.calls, len(self.responses)) - 1]
+        return self._next()
+
+    def post(self, *args, **kwargs):
+        self.last_kwargs = kwargs
+        return self._next()
 
     def delete(self, *args, **kwargs):
-        self.calls += 1
-        return self.responses[min(self.calls, len(self.responses)) - 1]
+        return self._next()
 
 
 def _fake_retry_state(exception):
@@ -280,3 +288,55 @@ def test_delete_accepts_204(monkeypatch):
     client = SmugMugClient(session, root_node_uri="")
 
     assert client._delete("/api/v2/album/x") is True
+
+
+def test_upload_bytes_sends_hex_content_md5():
+    """Content-MD5 must match the API's ArchivedMD5 format: 32-char hex."""
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={
+                    "stat": "ok",
+                    "Image": {
+                        "URL": "u",
+                        "ImageUri": "/api/v2/image/x",
+                        "UploadKey": "k",
+                    },
+                },
+            )
+        ]
+    )
+    client = SmugMugClient(session, root_node_uri="")
+
+    result = client._upload_bytes("/api/v2/album/x", "photo.jpg", b"abc")
+    assert result is not None
+
+    assert session.last_kwargs is not None
+    headers = session.last_kwargs["headers"]
+    assert headers["Content-MD5"] == hashlib.md5(b"abc").hexdigest()
+    assert len(headers["Content-MD5"]) == 32
+    assert result["md5"] == headers["Content-MD5"]
+
+
+def test_upload_bytes_rejects_control_chars_in_file_name():
+    client = SmugMugClient(FakeSession([]), root_node_uri="")
+
+    with pytest.raises(SmugMugError):
+        client._upload_bytes("/api/v2/album/x", "bad\r\nname.jpg", b"abc")
+
+
+def test_get_node_swallows_errors_by_default():
+    session = FakeSession([FakeResp(404, {}, text="not found")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client.get_node("/api/v2/node/x") is None
+
+
+def test_get_node_raise_on_error():
+    session = FakeSession([FakeResp(404, {}, text="not found")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    with pytest.raises(SmugMugError):
+        client.get_node("/api/v2/node/x", raise_on_error=True)

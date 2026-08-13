@@ -32,6 +32,11 @@ UPLOAD_TIMEOUT = 120
 CHUNK_SIZE = 500
 ILLEGAL_PATH_CHARS = re.compile(r'[\/\\:*?"<>|]')
 
+# Folder sort settings — values validated empirically against production
+# accounts (SortMethod/SortDirection enums of the API v2 docs).
+FOLDER_SORT_METHOD = 3
+FOLDER_SORT_DIRECTION = 1
+
 
 def _sanitize_path_segment(name: str) -> str:
     return ILLEGAL_PATH_CHARS.sub("-", name)
@@ -320,18 +325,26 @@ class SmugMugClient:
             next_page_uri = data.get("Response", {}).get("Pages", {}).get("NextPage")
         return children
 
-    def get_node(self, node_uri: str) -> dict[str, Any] | None:
+    def get_node(
+        self, node_uri: str, raise_on_error: bool = False
+    ) -> dict[str, Any] | None:
         try:
             data = self._get(node_uri)
             return data.get("Response", {}).get("Node")
         except SmugMugError:
+            if raise_on_error:
+                raise
             return None
 
-    def get_album_info(self, album_uri: str) -> dict[str, Any] | None:
+    def get_album_info(
+        self, album_uri: str, raise_on_error: bool = False
+    ) -> dict[str, Any] | None:
         try:
             data = self._get(album_uri)
             return data.get("Response", {}).get("Album")
         except SmugMugError:
+            if raise_on_error:
+                raise
             return None
 
     def get_or_create_node(
@@ -356,14 +369,17 @@ class SmugMugClient:
                 return child["Uri"]
 
         logger.info(f'Creating {node_type} "{node_name}" under {parent_node_uri}')
+        # UrlName intentionally omitted — SmugMug derives the URL slug from
+        # Name; sending our own would add a collision/sanitization surface
+        # (409s on illegal slug characters).
         payload: dict[str, Any] = {
             "Type": node_type,
             "Name": node_name,
             "Privacy": privacy,
         }
         if node_type == "Folder":
-            payload["SortMethod"] = 3
-            payload["SortDirection"] = 1
+            payload["SortMethod"] = FOLDER_SORT_METHOD
+            payload["SortDirection"] = FOLDER_SORT_DIRECTION
         if node_password:
             payload["SecurityType"] = "Password"
             payload["Password"] = node_password
@@ -582,9 +598,16 @@ class SmugMugClient:
     def _upload_bytes(
         self, album_uri: str, file_name: str, image_data: bytes
     ) -> dict[str, str] | None:
+        # Control characters would be rejected by requests (InvalidHeader);
+        # fail with a clear SmugMugError before the request instead.
+        if re.search(r"[\x00-\x1f\x7f]", file_name):
+            raise SmugMugError(f"File name contains control characters: {file_name!r}")
         mime_type, _ = mimetypes.guess_type(file_name)
         content_type = mime_type or "image/jpeg"
 
+        # Content-MD5 is sent as hex: SmugMug compares it as an opaque dedup
+        # key and reports the same 32-char hex digest as ArchivedMD5 (RFC 1864
+        # base64 is NOT what the live API accepts — see community clients).
         md5_hash = hashlib.md5(image_data).hexdigest()
         headers = {
             "Accept": "application/json",
