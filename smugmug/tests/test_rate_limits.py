@@ -4,6 +4,7 @@ import hashlib
 import logging
 
 import pytest
+import requests
 from requests_oauthlib import OAuth1Session
 
 from smugmug import RateLimitError, SmugMugClient, SmugMugError
@@ -28,7 +29,7 @@ class FakeResp:
 
 
 class FakeSession(OAuth1Session):
-    """Session stub — only ``get``/``post``/``delete`` are used by the tests, no auth internals."""
+    """Session stub — only ``get``/``post``/``patch``/``delete`` are used by the tests, no auth internals."""
 
     def __init__(self, responses):
         self.responses = list(responses)
@@ -46,8 +47,29 @@ class FakeSession(OAuth1Session):
         self.last_kwargs = kwargs
         return self._next()
 
+    def patch(self, *args, **kwargs):
+        return self._next()
+
     def delete(self, *args, **kwargs):
         return self._next()
+
+
+class RaisingSession(OAuth1Session):
+    """Session stub whose requests always fail with a network error."""
+
+    def __init__(self, exc):
+        self.exc = exc
+        self.calls = 0
+
+    def _raise(self, *args, **kwargs):
+        self.calls += 1
+        raise self.exc
+
+    def get(self, *args, **kwargs):
+        return self._raise()
+
+    def post(self, *args, **kwargs):
+        return self._raise()
 
 
 def _fake_retry_state(exception):
@@ -224,7 +246,7 @@ def test_move_collect_marks_failure_when_job_fails(monkeypatch):
     monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
 
     client = _job_client(FakeSession([]))
-    monkeypatch.setattr(client, "_post", lambda *a, **k: {"Response": {"Uri": "/job"}})
+    monkeypatch.setattr(client, "_post", lambda *a, **k: {"Uri": "/job"})
     monkeypatch.setattr(client, "_poll_async_job", lambda *a, **k: False)
 
     assert (
@@ -237,7 +259,7 @@ def test_move_collect_returns_true_when_job_completes(monkeypatch):
     monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
 
     client = _job_client(FakeSession([]))
-    monkeypatch.setattr(client, "_post", lambda *a, **k: {"Response": {"Uri": "/job"}})
+    monkeypatch.setattr(client, "_post", lambda *a, **k: {"Uri": "/job"})
     monkeypatch.setattr(client, "_poll_async_job", lambda *a, **k: True)
 
     assert (
@@ -432,3 +454,69 @@ def test_upload_sequential_is_paced(monkeypatch, tmp_path):
     client.upload("/api/v2/album/x", tmp_path, dedup=False, max_workers=1)
 
     assert slept == [0.2]
+
+
+def test_get_wraps_network_error_after_retries_exhausted(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = RaisingSession(requests.exceptions.ConnectionError("boom"))
+    client = SmugMugClient(session, root_node_uri="")
+
+    with pytest.raises(SmugMugError):
+        client._get("/api/v2/album/x")
+    assert session.calls == 5
+
+
+def test_upload_sequential_survives_network_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+    (tmp_path / "a.jpg").write_bytes(b"a")
+
+    session = RaisingSession(requests.exceptions.Timeout("slow"))
+    client = SmugMugClient(session, root_node_uri="")
+
+    uploaded, skipped = client.upload("/api/v2/album/x", tmp_path, max_workers=1)
+
+    assert uploaded == []
+    assert skipped == 0
+
+
+def test_delete_retries_on_server_errors_then_raises(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession([FakeResp(500, {}, text="boom")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    with pytest.raises(SmugMugError):
+        client._delete("/api/v2/album/x")
+    assert session.calls == 5
+
+
+def test_delete_album_returns_false_after_5xx_retries_exhausted(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession([FakeResp(500, {}, text="boom")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client.delete_album("/api/v2/album/x") is False
+    assert session.calls == 5
+
+
+def test_patch_description_returns_false_after_5xx_retries_exhausted(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession([FakeResp(500, {}, text="boom")])
+    client = SmugMugClient(session, root_node_uri="")
+
+    assert client.patch_album_description("/api/v2/node/x", "desc") is False
+    assert session.calls == 5
+
+
+def test_context_manager_closes_session(monkeypatch):
+    session = FakeSession([])
+    closed = []
+    monkeypatch.setattr(session, "close", lambda: closed.append(True))
+
+    with SmugMugClient(session, root_node_uri=""):
+        pass
+
+    assert closed == [True]

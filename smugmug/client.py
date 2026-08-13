@@ -5,6 +5,7 @@ No dependency on host applications — credentials are passed explicitly and
 logging goes through the standard ``logging`` module (logger name: "smugmug").
 """
 
+import functools
 import hashlib
 import logging
 import mimetypes
@@ -33,12 +34,21 @@ CHUNK_SIZE = 500
 ILLEGAL_PATH_CHARS = re.compile(r'[\/\\:*?"<>|]')
 
 # Folder sort settings — values validated empirically against production
-# accounts (SortMethod/SortDirection enums of the API v2 docs).
+# accounts (SortMethod/SortDirection enums of the API v2 docs). Do not "fix"
+# these without checking the live account: they control folder child
+# ordering and were verified against real folders, not the docs.
 FOLDER_SORT_METHOD = 3
 FOLDER_SORT_DIRECTION = 1
 
 # Pause between sequential uploads (gentle on rate limits).
 _SEQUENTIAL_UPLOAD_PACE = 0.2
+
+# MIME types mimetypes.guess_type() does not know (RAW camera formats).
+_RAW_MIME_TYPES = {
+    ".arw": "image/x-sony-arw",
+    ".dng": "image/x-adobe-dng",
+    ".rw2": "image/x-panasonic-rw2",
+}
 
 
 def _sanitize_path_segment(name: str) -> str:
@@ -199,6 +209,29 @@ _SESSION_RETRY = retry(
 _UPLOAD_MAX_ATTEMPTS = 4
 
 
+def _wrap_network_errors(verb: str):
+    """Convert network errors to SmugMugError AFTER retries are exhausted.
+
+    Must wrap OUTSIDE the retry decorator: tenacity's predicate needs the raw
+    Timeout/ConnectionError to decide to retry; once reraise=True re-raises
+    it, callers get a single error type instead of leaking requests exceptions.
+    """
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapped(self, uri: str, *args, **kwargs):
+            try:
+                return fn(self, uri, *args, **kwargs)
+            except requests.exceptions.RequestException as e:
+                raise SmugMugError(
+                    f"{verb} {uri}: network error after retries — {e}"
+                ) from e
+
+        return wrapped
+
+    return decorate
+
+
 def _make_upload_retry(file_name: str):
     """Upload-specific retry: same predicate as _SESSION_RETRY, logged per file."""
 
@@ -262,12 +295,18 @@ class SmugMugClient:
             resource_owner_key=access_token,
             resource_owner_secret=token_secret,
         )
-
-        r = session.get(
-            f"{API_BASE}/api/v2!authuser",
-            headers={"Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
-        )
+        # OAuth1Session signs via the Authorization header by default — the
+        # SmugMug uploader only accepts OAuth params in the header, never in
+        # the query string or body. Keep the default.
+        try:
+            r = session.get(
+                f"{API_BASE}/api/v2!authuser",
+                headers={"Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as e:
+            session.close()
+            raise SmugMugError(f"Auth request failed: {e}") from e
         if r.status_code != 200:
             session.close()
             raise SmugMugError(f"Auth failed: HTTP {r.status_code} — {r.text[:200]}")
@@ -279,6 +318,7 @@ class SmugMugClient:
         logger.debug(f"SmugMugClient: logged in as {logged_in}")
         return cls(session, root_node_uri)
 
+    @_wrap_network_errors("GET")
     @_SESSION_RETRY
     def _get(self, uri: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         r = self.session.get(
@@ -299,6 +339,7 @@ class SmugMugClient:
         # know the transport shape (fixing this in one place if it changes).
         return r.json().get("Response", {})
 
+    @_wrap_network_errors("POST")
     @_SESSION_RETRY
     def _post(
         self,
@@ -322,6 +363,7 @@ class SmugMugClient:
         _log_rate_limit_headers(r)
         return r.json().get("Response", {})
 
+    @_wrap_network_errors("PATCH")
     @_SESSION_RETRY
     def _patch(self, uri: str, payload: dict[str, Any]) -> bool:
         r = self.session.patch(
@@ -335,14 +377,25 @@ class SmugMugClient:
         if r.status_code == 200:
             _log_rate_limit_headers(r)
             return True
+        if 500 <= r.status_code < 600:
+            raise SmugMugError(
+                f"PATCH {uri}: HTTP {r.status_code} — {r.text[:200]}",
+                status_code=r.status_code,
+            )
         logger.warning(f"PATCH {uri}: HTTP {r.status_code} — {r.text[:200]}")
         return False
 
+    @_wrap_network_errors("DELETE")
     @_SESSION_RETRY
     def _delete(self, uri: str) -> bool:
         r = self.session.delete(f"{API_BASE}{uri}", timeout=REQUEST_TIMEOUT)
         if r.status_code == 429:
             raise _rate_limit_error(r, f"DELETE {uri}")
+        if 500 <= r.status_code < 600:
+            raise SmugMugError(
+                f"DELETE {uri}: HTTP {r.status_code} — {r.text[:200]}",
+                status_code=r.status_code,
+            )
         _log_rate_limit_headers(r)
         return r.status_code in (200, 201, 204)
 
@@ -492,8 +545,9 @@ class SmugMugClient:
         self, to_album_uri: str, uris: list[str], endpoint: str
     ) -> bool:
         key = "MoveUris" if endpoint == "moveimages" else "CollectUris"
+        chunks = list(batched(uris, CHUNK_SIZE, strict=False))
         all_ok = True
-        for i, chunk in enumerate(batched(uris, CHUNK_SIZE, strict=False), 1):
+        for i, chunk in enumerate(chunks, 1):
             try:
                 resp = self._post(
                     f"{to_album_uri}!{endpoint}",
@@ -507,7 +561,8 @@ class SmugMugClient:
             except SmugMugError as e:
                 logger.error(f"{endpoint} chunk failed: {e}")
                 all_ok = False
-            time.sleep(0.5)
+            if i < len(chunks):
+                time.sleep(0.5)
         return all_ok
 
     def _poll_async_job(
@@ -540,7 +595,11 @@ class SmugMugClient:
         return False
 
     def delete_album(self, album_uri: str) -> bool:
-        ok = self._delete(album_uri)
+        try:
+            ok = self._delete(album_uri)
+        except SmugMugError as e:
+            logger.warning(f"Failed to delete {album_uri}: {e}")
+            return False
         if ok:
             logger.info(f"Deleted album {album_uri}")
         else:
@@ -548,7 +607,11 @@ class SmugMugClient:
         return ok
 
     def patch_album_description(self, node_uri: str, description: str) -> bool:
-        return self._patch(node_uri, {"Description": description})
+        try:
+            return self._patch(node_uri, {"Description": description})
+        except SmugMugError as e:
+            logger.warning(f"Failed to patch description of {node_uri}: {e}")
+            return False
 
     # --- Deduplication ---
 
@@ -560,8 +623,8 @@ class SmugMugClient:
             for img in data.get("AlbumImage", []):
                 images.append(
                     {
-                        "FileName": img["FileName"],
-                        "ArchivedMD5": img["ArchivedMD5"],
+                        "FileName": img.get("FileName", ""),
+                        "ArchivedMD5": img.get("ArchivedMD5", ""),
                         "Uri": img.get("Uri", ""),
                         "ImageKey": img.get("ImageKey", ""),
                     }
@@ -612,8 +675,8 @@ class SmugMugClient:
             uploaded = self._upload_parallel(album_uri, files, max_workers)
 
         logger.info(
-            f"Uploaded {len(uploaded)}/{len(files)} files, skipped {skipped} "
-            f"from {folder_path.name}"
+            f"Uploaded {len(uploaded)}/{len(files)} files, skipped {skipped}, "
+            f"failed {len(files) - len(uploaded)} from {folder_path.name}"
         )
         return uploaded, skipped
 
@@ -644,7 +707,12 @@ class SmugMugClient:
         if re.search(r"[\x00-\x1f\x7f]", file_name):
             raise SmugMugError(f"File name contains control characters: {file_name!r}")
         mime_type, _ = mimetypes.guess_type(file_name)
-        content_type = mime_type or "image/jpeg"
+        content_type = mime_type or _RAW_MIME_TYPES.get(Path(file_name).suffix.lower())
+        if not content_type:
+            logger.warning(
+                f"Unknown file type for {file_name!r}, sending as image/jpeg"
+            )
+            content_type = "image/jpeg"
 
         # Content-MD5 is sent as hex: SmugMug compares it as an opaque dedup
         # key and reports the same 32-char hex digest as ArchivedMD5 (RFC 1864
@@ -683,7 +751,7 @@ class SmugMugClient:
 
         try:
             result = _do_upload()
-        except SmugMugError as e:
+        except (SmugMugError, requests.exceptions.RequestException) as e:
             logger.error(f"Upload FAILED for {file_name}: {e}")
             return None
 
@@ -711,6 +779,9 @@ class SmugMugClient:
     def _upload_parallel(
         self, album_uri: str, files: list[Path], max_workers: int
     ) -> list[dict[str, str]]:
+        # Assumption: sharing one OAuth1Session across worker threads is safe
+        # in practice (urllib3 connection pools are thread-safe). If uploads
+        # ever misbehave under load, give each worker its own session.
         uploaded: list[dict[str, str]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
