@@ -13,9 +13,10 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import IntEnum
 from itertools import batched
 from pathlib import Path
-from typing import Any
+from typing import Any, Self, TypedDict
 
 import requests
 from requests_oauthlib import OAuth1Session
@@ -34,12 +35,23 @@ UPLOAD_TIMEOUT = 120
 CHUNK_SIZE = 500
 ILLEGAL_PATH_CHARS = re.compile(r'[\/\\:*?"<>|]')
 
-# Folder sort settings — values validated empirically against production
-# accounts (SortMethod/SortDirection enums of the API v2 docs). Do not "fix"
-# these without checking the live account: they control folder child
-# ordering and were verified against real folders, not the docs.
-FOLDER_SORT_METHOD = 3
-FOLDER_SORT_DIRECTION = 1
+
+class FolderSortMethod(IntEnum):
+    """SortMethod value for folder children.
+
+    Verified empirically against production accounts, not the API docs. Do
+    not "fix" the value without checking a live account: it controls folder
+    child ordering and was confirmed against real folders, not the docs.
+    """
+
+    V3 = 3
+
+
+class FolderSortDirection(IntEnum):
+    """SortDirection value for folder children (see FolderSortMethod)."""
+
+    V1 = 1
+
 
 # Pause between sequential uploads (gentle on rate limits).
 _SEQUENTIAL_UPLOAD_PACE = 0.2
@@ -50,6 +62,25 @@ _RAW_MIME_TYPES = {
     ".dng": "image/x-adobe-dng",
     ".rw2": "image/x-panasonic-rw2",
 }
+
+
+class AlbumImage(TypedDict):
+    """Row of ``get_album_image_hashes`` (AlbumImage shape of the API)."""
+
+    FileName: str
+    ArchivedMD5: str
+    Uri: str
+    ImageKey: str
+
+
+class UploadResult(TypedDict):
+    """Normalized result of a single upload (``_upload_result``)."""
+
+    url: str
+    image_uri: str
+    image_key: str
+    md5: str
+    file_name: str
 
 
 def _sanitize_path_segment(name: str) -> str:
@@ -139,7 +170,7 @@ def _validate_file_name(file_name: str) -> None:
 
 def _upload_result(
     result: dict[str, Any], md5_hash: str, file_name: str
-) -> dict[str, str]:
+) -> UploadResult:
     img = result.get("Image", {})
     image_url = img.get("URL", "")
     image_uri = img.get("ImageUri", "")
@@ -314,7 +345,7 @@ class SmugMugClient:
         self.root_node_uri = root_node_uri
         self.headers = {"Accept": "application/json"}
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -329,7 +360,7 @@ class SmugMugClient:
         access_token: str,
         token_secret: str,
         nickname: str | None = None,
-    ) -> SmugMugClient:
+    ) -> Self:
         """Authenticate and return a client.
 
         Args:
@@ -525,8 +556,8 @@ class SmugMugClient:
             "Privacy": privacy,
         }
         if node_type == "Folder":
-            payload["SortMethod"] = FOLDER_SORT_METHOD
-            payload["SortDirection"] = FOLDER_SORT_DIRECTION
+            payload["SortMethod"] = FolderSortMethod.V3
+            payload["SortDirection"] = FolderSortDirection.V1
         if node_password:
             payload["SecurityType"] = "Password"
             payload["Password"] = node_password
@@ -689,8 +720,8 @@ class SmugMugClient:
 
     # --- Deduplication ---
 
-    def get_album_image_hashes(self, album_uri: str) -> list[dict[str, str]]:
-        images: list[dict[str, str]] = []
+    def get_album_image_hashes(self, album_uri: str) -> list[AlbumImage]:
+        images: list[AlbumImage] = []
         next_page_uri: str | None = f"{album_uri}!images"
         params: dict[str, Any] | None = {"count": 500, "_expand": "Image"}
         while next_page_uri:
@@ -716,7 +747,7 @@ class SmugMugClient:
         dedup: bool = False,
         max_workers: int = 1,
         extensions: set[str] | None = None,
-    ) -> tuple[list[dict[str, str]], int]:
+    ) -> tuple[list[UploadResult], int]:
         """Upload files from a folder, optionally skipping duplicates.
 
         ``dedup`` filters out files whose MD5 already exists in the album
@@ -757,8 +788,8 @@ class SmugMugClient:
 
     def _upload_sequential(
         self, album_uri: str, files: list[Path]
-    ) -> list[dict[str, str]]:
-        uploaded: list[dict[str, str]] = []
+    ) -> list[UploadResult]:
+        uploaded: list[UploadResult] = []
         for fp in files:
             result = self.upload_file(album_uri, fp)
             if result:
@@ -768,7 +799,7 @@ class SmugMugClient:
 
     # --- Upload ---
 
-    def upload_file(self, album_uri: str, file_path: Path) -> dict[str, str] | None:
+    def upload_file(self, album_uri: str, file_path: Path) -> UploadResult | None:
         """Upload a single file, streamed from disk (bounded memory usage)."""
         file_name = file_path.name
         _validate_file_name(file_name)
@@ -814,7 +845,7 @@ class SmugMugClient:
 
     def _upload_bytes(
         self, album_uri: str, file_name: str, image_data: bytes
-    ) -> dict[str, str] | None:
+    ) -> UploadResult | None:
         # Control characters would be rejected by requests (InvalidHeader);
         # fail with a clear SmugMugError before the request instead.
         _validate_file_name(file_name)
@@ -857,7 +888,7 @@ class SmugMugClient:
 
     def upload_new_only(
         self, album_uri: str, folder_path: Path, extensions: set[str] | None = None
-    ) -> tuple[list[dict[str, str]], int]:
+    ) -> tuple[list[UploadResult], int]:
         """Upload files not already in the album (MD5 dedup). See ``upload(dedup=True)``."""
         return self.upload(
             album_uri, folder_path, dedup=True, max_workers=1, extensions=extensions
@@ -865,11 +896,11 @@ class SmugMugClient:
 
     def _upload_parallel(
         self, album_uri: str, files: list[Path], max_workers: int
-    ) -> list[dict[str, str]]:
+    ) -> list[UploadResult]:
         # Assumption: sharing one OAuth1Session across worker threads is safe
         # in practice (urllib3 connection pools are thread-safe). If uploads
         # ever misbehave under load, give each worker its own session.
-        uploaded: list[dict[str, str]] = []
+        uploaded: list[UploadResult] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {
                 executor.submit(self.upload_file, album_uri, fp): fp.name
@@ -891,7 +922,7 @@ class SmugMugClient:
         folder_path: Path,
         max_workers: int = 4,
         extensions: set[str] | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[UploadResult]:
         """Parallel upload of every file in a folder. See ``upload(max_workers=N)``."""
         return self.upload(
             album_uri,
