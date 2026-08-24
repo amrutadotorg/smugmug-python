@@ -663,7 +663,13 @@ class SmugMugClient:
         poll_interval: float = 2.0,
         max_wait: float = 120.0,
     ) -> bool:
-        """Poll an async job until it completes. True only on "Completed"."""
+        """Poll an async job until it completes.
+
+        The task fields may arrive at top level or nested under ``"Task"``;
+        the terminal success status is ``"Done"`` (also accepted: the
+        legacy ``"Completed"`` or ``PercentComplete == 100``). ``"Failed"``
+        aborts early with the task results logged.
+        """
         job_uri = response.get("Uri", "")
         if not job_uri:
             logger.warning("Async job response has no Uri to poll")
@@ -672,12 +678,20 @@ class SmugMugClient:
         while elapsed < max_wait:
             try:
                 status_resp = self._get(job_uri)
-                status = status_resp.get("Status", "")
-                if status == "Completed":
+                payload = status_resp.get("Task")
+                if not isinstance(payload, dict):
+                    payload = status_resp
+                status = str(payload.get("Status", ""))
+                if (
+                    status in ("Done", "Completed")
+                    or payload.get("PercentComplete") == 100
+                ):
                     logger.debug(f"Async job {job_uri} completed in {elapsed:.0f}s")
                     return True
                 if status == "Failed":
-                    logger.error(f"Async job {job_uri} failed")
+                    logger.error(
+                        f"Async job {job_uri} failed: {payload.get('Results')}"
+                    )
                     return False
             except SmugMugError as e:
                 logger.warning(f"Async job poll failed for {job_uri}: {e}")

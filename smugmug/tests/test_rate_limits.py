@@ -217,6 +217,72 @@ def test_poll_async_job_returns_true_on_completed(monkeypatch):
     assert client._poll_async_job({"Uri": "/api/v2/job/x"}) is True
 
 
+def test_poll_async_job_returns_true_on_nested_task_done(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={
+                    "Response": {
+                        "Task": {
+                            "Status": "Done",
+                            "PercentComplete": 100,
+                            "Results": {"success": ["1"], "failure": []},
+                        }
+                    }
+                },
+            )
+        ]
+    )
+    client = _job_client(session)
+
+    assert client._poll_async_job({"Uri": "/api/v2/task/y"}) is True
+
+
+def test_poll_async_job_returns_true_on_percent_complete(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={"Response": {"Status": "Weird", "PercentComplete": 100}},
+            )
+        ]
+    )
+    client = _job_client(session)
+
+    assert client._poll_async_job({"Uri": "/api/v2/task/z"}) is True
+
+
+def test_poll_async_job_returns_false_on_nested_failed(monkeypatch):
+    monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
+
+    session = FakeSession(
+        [
+            FakeResp(
+                200,
+                {},
+                json_data={
+                    "Response": {
+                        "Task": {
+                            "Status": "Failed",
+                            "Results": {"success": [], "failure": ["1"]},
+                        }
+                    }
+                },
+            )
+        ]
+    )
+    client = _job_client(session)
+
+    assert client._poll_async_job({"Uri": "/api/v2/task/w"}) is False
+
+
 def test_poll_async_job_returns_false_on_failed(monkeypatch):
     monkeypatch.setattr("smugmug.client.time.sleep", lambda s: None)
 

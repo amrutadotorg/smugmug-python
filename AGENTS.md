@@ -38,9 +38,11 @@ as `~/SCRIPTS/soundcloud-python` (standalone repo, installed into
   wrapper; `move_image_uris` / `collect_image_uris` move or collect specific
   images (idempotent flows).
 - Async job endpoints (`moveimages`/`collectimages`) may take > 2 minutes
-  server-side; `_poll_async_job` polls up to 120 s and returns `bool` —
-  `move_images`/`collect_images` return `False` when a job fails or times
-  out (they do not silently report success).
+  server-side; `_poll_async_job` polls up to 120 s and returns `bool`.
+  Success = `Status "Done"` (legacy `"Completed"`) or `PercentComplete == 100`,
+  read from `Task.Status` when the response nests it there. `Failed` aborts
+  early. `move_images`/`collect_images` return `False` when a job fails or
+  times out (they do not silently report success).
 
 ## Commands
 
