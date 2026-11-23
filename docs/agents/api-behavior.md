@@ -1,0 +1,26 @@
+# API behavior rules — smugmug-python
+
+Invariants of `smugmug/client.py` that must survive any change.
+
+## Idempotent album creation
+
+`get_album_else_create` splits the `"parent/album"` path BEFORE sanitizing
+each segment — never sanitize the whole path first (that collapses the
+hierarchy). Accepted risk: `get_or_create_node` is list-then-create (TOCTOU);
+a 409 race is resolved by re-listing, but a duplicate name that returns 200
+instead of 409 would create a second node.
+
+## Dedup
+
+`upload(..., dedup=True)` and `get_album_image_hashes` (ArchivedMD5) are the
+dedup primitives; `upload_new_only` is a thin wrapper; `move_image_uris` /
+`collect_image_uris` move or collect specific images (idempotent flows).
+
+## Async job polling
+
+Async job endpoints (`moveimages`/`collectimages`) may take > 2 minutes
+server-side; `_poll_async_job` polls up to 120 s and returns `bool`.
+Success = `Status "Done"` (legacy `"Completed"`) or `PercentComplete == 100`,
+read from `Task.Status` when the response nests it there. `Failed` aborts
+early. `move_images`/`collect_images` return `False` when a job fails or
+times out (they do not silently report success).
